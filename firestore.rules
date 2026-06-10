@@ -1,0 +1,232 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Phase 3: Primitive Definition
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isSignedIn() { return request.auth != null; }
+    
+    // We assume the user has a document in 'employees' with their userId as ID, or we index by email
+    // But since auth.uid is usually the doc ID in employees, let's use that.
+    function isManager() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/employees/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/employees/$(request.auth.uid)).data.role == "MANAGER";
+    }
+
+    // ----------------------------------------------------
+    // Employees Collection
+    // ----------------------------------------------------
+    function isValidEmployee(data) {
+      return data.keys().hasAll(['id', 'name', 'email', 'role', 'active']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.name is string && data.name.size() <= 128 &&
+        data.email is string && data.email.size() <= 128 &&
+        data.role is string && data.role.size() <= 50 &&
+        data.active is bool;
+    }
+
+    match /employees/{employeeId} {
+      // Employees can read all employees (to see schedule). 
+      allow get: if isSignedIn() && isValidId(employeeId);
+      allow list: if isSignedIn(); // All signed in users can list employees to see schedule. 
+      // Only manager can create/update employees, except users can update their own avatar/phone (Tiered)
+      // Actually, since there's no auth flow other than google login, the app must create employees.
+      allow create: if isManager() && isValidId(employeeId) && isValidEmployee(incoming());
+      
+      allow update: if isSignedIn() && isValidId(employeeId) && isValidEmployee(incoming()) && (
+        isManager() ||
+        (request.auth.uid == employeeId && incoming().diff(existing()).affectedKeys().hasOnly(['phone', 'avatarUrl', 'password']))
+      );
+      
+      allow delete: if isManager() && isValidId(employeeId);
+    }
+
+    // ----------------------------------------------------
+    // Shifts Collection
+    // ----------------------------------------------------
+    function isValidShift(data) {
+      return data.keys().hasAll(['id', 'employeeId', 'date', 'type', 'room', 'hoursWorked']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.employeeId is string && data.employeeId.size() <= 128 &&
+        data.date is string && data.date.size() <= 20 &&
+        data.type is string && data.type.size() <= 50 &&
+        data.room is string && data.room.size() <= 128 &&
+        data.hoursWorked is number;
+    }
+
+    match /shifts/{shiftId} {
+      allow get: if isSignedIn() && isValidId(shiftId);
+      allow list: if isSignedIn(); 
+      // Only managers can create/update/delete shifts, OR maybe supervisors.
+      
+      allow create: if isManager() && isValidId(shiftId) && isValidShift(incoming());
+      allow update: if isManager() && isValidId(shiftId) && isValidShift(incoming());
+      allow delete: if isManager() && isValidId(shiftId);
+    }
+
+    // ----------------------------------------------------
+    // SwapRequests Collection
+    // ----------------------------------------------------
+    function isValidSwapRequest(data) {
+      return data.keys().hasAll(['id', 'requesterId', 'shiftId', 'shiftDate', 'shiftType', 'status']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.requesterId is string && data.requesterId.size() <= 128 &&
+        data.shiftId is string && data.shiftId.size() <= 128 &&
+        data.shiftDate is string && data.shiftDate.size() <= 20 &&
+        data.shiftType is string && data.shiftType.size() <= 50 &&
+        data.status is string && data.status.size() <= 50;
+    }
+
+    match /swapRequests/{swapId} {
+      allow get: if isSignedIn() && isValidId(swapId);
+      allow list: if isSignedIn();
+      
+      // employee can create swap request if they are the requester
+      allow create: if isSignedIn() && isValidId(swapId) && isValidSwapRequest(incoming()) && 
+                    incoming().requesterId == request.auth.uid;
+                    
+      // employee can update if they are fulfilling it, manager can update anything
+      allow update: if isSignedIn() && isValidId(swapId) && isValidSwapRequest(incoming()) && (
+        isManager() ||
+        (existing().status == 'PENDING' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'resolvedById', 'resolvedAt']))
+      );
+      
+      // employee can delete their own
+      allow delete: if (isSignedIn() && existing().requesterId == request.auth.uid) || isManager();
+    }
+
+    // ----------------------------------------------------
+    // Absences Collection
+    // ----------------------------------------------------
+    function isValidAbsence(data) {
+      return data.keys().hasAll(['id', 'employeeId', 'date', 'shiftType', 'covered']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.employeeId is string && data.employeeId.size() <= 128 &&
+        data.date is string && data.date.size() <= 20 &&
+        data.shiftType is string && data.shiftType.size() <= 50 &&
+        data.covered is bool;
+    }
+
+    match /absences/{absenceId} {
+      allow get: if isSignedIn() && isValidId(absenceId);
+      allow list: if isSignedIn();
+      
+      // employee can create absence if they are the employee
+      allow create: if isSignedIn() && isValidId(absenceId) && isValidAbsence(incoming()) && 
+                    incoming().employeeId == request.auth.uid;
+                    
+      // employee can cover an absence
+      allow update: if isSignedIn() && isValidId(absenceId) && isValidAbsence(incoming()) && (
+        isManager() ||
+        (existing().covered == false && incoming().diff(existing()).affectedKeys().hasOnly(['covered', 'coverEmployeeId']))
+      );
+      
+      allow delete: if isManager();
+    }
+
+    // ----------------------------------------------------
+    // Evaluations Collection
+    // ----------------------------------------------------
+    function isValidEval(data) {
+      return data.keys().hasAll(['id', 'employeeId', 'month', 'overallScore', 'evaluatorId']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.employeeId is string && data.employeeId.size() <= 128 &&
+        data.month is string && data.month.size() <= 20 &&
+        data.overallScore is number &&
+        data.evaluatorId is string && data.evaluatorId.size() <= 128;
+    }
+
+    match /evaluations/{evalId} {
+      // Employees can only read their own evaluations. Managers can read all.
+      allow get: if isSignedIn() && isValidId(evalId) && (isManager() || existing().employeeId == request.auth.uid);
+      allow list: if isSignedIn() && (isManager() || resource.data.employeeId == request.auth.uid);
+      
+      allow create: if isManager() && isValidId(evalId) && isValidEval(incoming());
+      allow update: if isManager() && isValidId(evalId) && isValidEval(incoming());
+      allow delete: if isManager() && isValidId(evalId);
+    }
+
+    // ----------------------------------------------------
+    // LeaveRequests Collection
+    // ----------------------------------------------------
+    function isValidLeave(data) {
+      return data.keys().hasAll(['id', 'employeeId', 'leaveType', 'startDate', 'endDate', 'totalDays', 'status']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.employeeId is string && data.employeeId.size() <= 128 &&
+        data.leaveType is string && data.leaveType.size() <= 50 &&
+        data.startDate is string && data.startDate.size() <= 20 &&
+        data.endDate is string && data.endDate.size() <= 20 &&
+        data.totalDays is number &&
+        data.status is string && data.status.size() <= 50;
+    }
+
+    match /leaves/{leaveId} {
+      allow get: if isSignedIn() && isValidId(leaveId) && (isManager() || existing().employeeId == request.auth.uid);
+      allow list: if isSignedIn() && (isManager() || resource.data.employeeId == request.auth.uid);
+      
+      allow create: if isSignedIn() && isValidId(leaveId) && isValidLeave(incoming()) && incoming().employeeId == request.auth.uid;
+      allow update: if isManager() && isValidId(leaveId) && isValidLeave(incoming());
+      allow delete: if isManager() || (isSignedIn() && existing().employeeId == request.auth.uid && existing().status == 'PENDING');
+    }
+
+    // ----------------------------------------------------
+    // AdminNotices Collection
+    // ----------------------------------------------------
+    function isValidNotice(data) {
+      return data.keys().hasAll(['id', 'title', 'content', 'category', 'authorId', 'createdAt']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.title is string && data.title.size() <= 256 &&
+        data.content is string && data.content.size() <= 10000 &&
+        data.category is string && data.category.size() <= 50 &&
+        data.authorId is string && data.authorId.size() <= 128 &&
+        data.createdAt is string && data.createdAt.size() <= 50;
+    }
+    
+    match /notices/{noticeId} {
+      allow get: if isSignedIn() && isValidId(noticeId);
+      allow list: if isSignedIn();
+      
+      allow create: if isManager() && isValidId(noticeId) && isValidNotice(incoming());
+      allow update: if isManager() && isValidId(noticeId) && isValidNotice(incoming());
+      allow delete: if isManager() && isValidId(noticeId);
+    }
+    
+    // ----------------------------------------------------
+    // SystemSettings Collection
+    // ----------------------------------------------------
+    function isValidSettings(data) {
+      return data.keys().hasAll(['showAlgorithmToEmployees', 'showSmartControlToEmployees']) &&
+        data.showAlgorithmToEmployees is bool &&
+        data.showSmartControlToEmployees is bool;
+    }
+
+    match /settings/{docId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      
+      allow create: if isManager() && isValidSettings(incoming());
+      allow update: if isManager() && isValidSettings(incoming());
+      allow delete: if isManager();
+    }
+    
+    // ----------------------------------------------------
+    // State Collection (Server sync)
+    // ----------------------------------------------------
+    match /state/{stateId} {
+      // The Node.js server syncs state using unauthenticated client SDK by default
+      // In production you would use Firebase Admin sdk or service accounts, 
+      // but for this preview unauthenticated syncing to state document is allowed.
+      allow read, write: if true;
+    }
+  }
+}
